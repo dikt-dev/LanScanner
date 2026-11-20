@@ -49,12 +49,13 @@ jobs:
 
       # ---- 下面两步在 SignPath 申请通过后启用（见 SIGNPATH-申请指南.md）----
       # - name: Submit signing request to SignPath
-      #   uses: signpath/github-action-submit-signing-request@v1
+      #   uses: signpath/github-action-submit-signing-request@v3
       #   with:
       #     api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
       #     organization-id: ${{ secrets.SIGNPATH_ORG_ID }}
       #     project-slug: lanscanner
-      #     signing-policy-slug: release-signing
+      #     signing-policy-slug: release-signing          # 自测阶段先填 test-signing
+      #     artifact-configuration-slug: lanscanner       # 根元素要 <zip-file>，因为 upload-artifact 默认打包成 zip
       #     github-artifact-id: ${{ steps.upload.outputs.artifact-id }}
       #     wait-for-completion: true
       #     output-artifact-directory: signed
