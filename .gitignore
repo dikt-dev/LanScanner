@@ -1,0 +1,13 @@
+# 生成物
+release/
+bin/
+obj/
+*.zip
+
+# 个人配置
+settings.ini
+*.user
+
+# 调试产物
+LanScanner-ui-*.png
+*.metrics.txt

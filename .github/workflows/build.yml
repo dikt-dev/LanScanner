@@ -1,0 +1,66 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compile with csc (.NET Framework 4.x)
+        shell: cmd
+        run: |
+          if not exist dist mkdir dist
+          set CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
+          if not exist "%CSC%" set CSC=%WINDIR%\Microsoft.NET\Framework\v4.0.30319\csc.exe
+          "%CSC%" /nologo /target:winexe /codepage:65001 /optimize+ /out:dist\LanScanner.exe ^
+            /r:System.dll /r:System.Windows.Forms.dll /r:System.Drawing.dll ^
+            Scan.cs Oui.cs Prefs.cs Ui.cs RangePicker.cs
+          if errorlevel 1 exit /b 1
+          copy /y LanScanner.md dist\ >nul
+          copy /y LanScanner-ui.png dist\ >nul
+
+      - name: Smoke test (range parser)
+        shell: cmd
+        run: |
+          cd dist
+          LanScanner.exe --rangetest
+          type %TEMP%\LanScanner-rangetest.txt
+
+      - name: Upload unsigned artifact
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-lanscanner
+          path: dist/LanScanner.exe
+          retention-days: 7
+
+      # ---- 下面两步在 SignPath 申请通过后启用（见 SIGNPATH-申请指南.md）----
+      # - name: Submit signing request to SignPath
+      #   uses: signpath/github-action-submit-signing-request@v1
+      #   with:
+      #     api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+      #     organization-id: ${{ secrets.SIGNPATH_ORG_ID }}
+      #     project-slug: lanscanner
+      #     signing-policy-slug: release-signing
+      #     github-artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      #     wait-for-completion: true
+      #     output-artifact-directory: signed
+      #
+      # - name: Upload signed artifact
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: signed-lanscanner
+      #     path: signed/**
