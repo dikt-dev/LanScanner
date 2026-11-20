@@ -209,3 +209,5 @@ powershell -NoProfile -ExecutionPolicy Bypass -File make-release.ps1
 ### 不要做的事
 
 不要建议对方去关「检查应用和文件」（SmartScreen），也不要把「关掉 Defender」写进任何说明——这会让对方整台机器失去保护，而问题只是缺一个签名。
+
+仓库与发布页：`https://github.com/dikt-dev/LanScanner` — 新版本从 Releases 下载即可，不必每次找作者要 zip。

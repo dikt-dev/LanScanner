@@ -20,13 +20,11 @@ SignPath Foundation 给**开源项目**免费签发代码签名证书。证书�
 ### 1. 把代码推到公开仓库
 
 ```
-git init
-git add .
-git commit -m "LanScanner: LAN host scanner (MIT)"
-git branch -M main
-git remote add origin https://github.com/<你的账号>/lanscanner.git
+git remote add origin https://github.com/dikt-dev/LanScanner.git
 git push -u origin main
 ```
+
+（本目录已经是 git 仓库、分支 `main`、首次提交已完成）
 
 推送前确认不要带上：`release\`（生成的包）、`bin\`/`obj\`、你自己的 `settings.ini`。建议加 `.gitignore`。
 

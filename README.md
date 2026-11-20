@@ -1,5 +1,10 @@
 # LanScanner — 局域网设备扫描器
 
+[![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![build](https://github.com/dikt-dev/LanScanner/actions/workflows/build.yml/badge.svg)](https://github.com/dikt-dev/LanScanner/actions/workflows/build.yml)
+
+仓库：https://github.com/dikt-dev/LanScanner
+
 一次性把 `192.168.0.0/16` 这么大的网段扫完，找出所有能连通的子设备，列出 IP / MAC / 厂商 / ARP 状态 / 路由路径。
 排查「网线插着的设备到底在哪个 IP」用它。
 
@@ -39,8 +44,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File make-release.ps1
 ```
 
 生成 `release\LanScanner-v<日期>.zip`，对方解压后先跑 `1-unblock-first.cmd`（清「来自 Internet」标记）再跑 `2-start.cmd`。
+
+正式发布版从 [Releases](https://github.com/dikt-dev/LanScanner/releases) 下载，那里放的是 CI 构建（并将在 SignPath 申请通过后）签名过的 exe。
 原因与本项目的免费签名路线见 [LanScanner.md](LanScanner.md) 的「发给别人用」一节。
 
 ## 许可证
 
-MIT，见 [LICENSE](LICENSE)。
+MIT，见 [LICENSE](LICENSE)。Copyright (c) 2026 dikt-dev
