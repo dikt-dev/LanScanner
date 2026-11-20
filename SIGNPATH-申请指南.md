@@ -33,6 +33,11 @@ git push -u origin main
 打开仓库的 **Actions → build**，确认 `Compile with csc` 与 `Smoke test` 都绿。这一步同时证明「CI 能从源码构建出 exe」，
 是 SignPath 审核看的核心材料。
 
+> 已跑通的一次（可作为审核材料直接引用）：
+> `https://github.com/dikt-dev/LanScanner/actions/runs/44676953832` → conclusion **success**，
+> 五步全绿（Set up job / Checkout / Compile with csc / Smoke test / Upload unsigned artifact），
+> 产出 artifact `unsigned-lanscanner`（约 35 KB，内含 `LanScanner.exe`）。
+
 ### 3. 提交申请
 
 1. 访问 `https://signpath.org/` → **Apply**（或 `https://signpath.org/apply`）；
