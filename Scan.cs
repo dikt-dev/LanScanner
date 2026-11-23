@@ -2,12 +2,14 @@
 using System.Runtime.InteropServices;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -1297,6 +1299,404 @@ namespace LanScanner
                 return IpUtil.ToUInt(x.Ip).CompareTo(IpUtil.ToUInt(y.Ip));
             });
             return hits;
+        }
+    }
+
+    // 探测段预设：GUI 与命令行共用（扫描范围 / 192.168.x 全段 / 常见私有段）
+    public static class ProbePresets
+    {
+        public const string Range = "range";
+        public const string All16 = "192168";
+        public const string CommonSeg = "common";
+
+        public static List<string> ForPreset(string preset, string rangeText)
+        {
+            string p = preset == null ? "" : preset.Trim().ToLowerInvariant();
+            if (p == All16 || p == "192.168" || p == "all") return All192168();
+            if (p == CommonSeg || p == "private") return CommonList();
+            return FromRange(rangeText);
+        }
+
+        public static List<string> FromRange(string rangeText)
+        {
+            return DirectProbe.SegmentsFromRange(rangeText);
+        }
+
+        public static List<string> All192168()
+        {
+            return DirectProbe.SegmentsFromRange("192.168.0.0/16");
+        }
+
+        public static List<string> CommonList()
+        {
+            string[] blocks = new string[] { "192.168.0.0/16", "10.0.0.0/16", "10.10.0.0/16", "172.16.0.0/16", "169.254.0.0/16" };
+            List<string> list = new List<string>();
+            HashSet<string> seen = new HashSet<string>();
+            for (int i = 0; i < blocks.Length; i++)
+            {
+                List<string> one = DirectProbe.SegmentsFromRange(blocks[i]);
+                for (int j = 0; j < one.Count; j++)
+                {
+                    if (seen.Add(one[j])) list.Add(one[j]);
+                }
+            }
+            return list;
+        }
+
+        public static string Label(string preset)
+        {
+            string p = preset == null ? "" : preset.Trim().ToLowerInvariant();
+            if (p == All16 || p == "192.168" || p == "all") return "192.168.x 全段";
+            if (p == CommonSeg || p == "private") return "常见私有段";
+            return "扫描范围";
+        }
+
+        public static string Eta(int segments)
+        {
+            double secs = segments * 0.75;
+            if (secs < 90) return ((int)Math.Round(secs)) + " 秒";
+            return ((int)Math.Round(secs / 60.0)) + " 分钟";
+        }
+    }
+
+    // 链路体检：网卡计数器 + 可选 pktmon 抓包，判断线上到底有没有帧、对端是谁
+    public static class LinkCheck
+    {
+        public class Peer
+        {
+            public string Mac = "";
+            public string Vendor = "";
+            public string Ip = "";
+        }
+
+        public class Evidence
+        {
+            public string Adapter = "";
+            public string Status = "";
+            public string Type = "";
+            public long SpeedMbps;
+            public long RxBytes0;
+            public long RxBytes1;
+            public long RxPackets0;
+            public long RxPackets1;
+            public long TxBytes0;
+            public long TxBytes1;
+            public int Seconds;
+            public List<Peer> Peers = new List<Peer>();
+            public bool SniffUsed;
+            public string Verdict = "";
+
+            public long RxDelta { get { return RxBytes1 - RxBytes0; } }
+            public long RxPacketsDelta { get { return RxPackets1 - RxPackets0; } }
+            public long TxDelta { get { return TxBytes1 - TxBytes0; } }
+        }
+
+        public static NetworkInterface FindAdapter(string name)
+        {
+            if (name == null) return null;
+            string want = name.Trim();
+            if (want.Length == 0) return null;
+            NetworkInterface[] all = NetworkInterface.GetAllNetworkInterfaces();
+            for (int i = 0; i < all.Length; i++)
+            {
+                if (string.Equals(all[i].Name, want, StringComparison.OrdinalIgnoreCase)) return all[i];
+            }
+            for (int i = 0; i < all.Length; i++)
+            {
+                if (all[i].Description != null && all[i].Description.IndexOf(want, StringComparison.OrdinalIgnoreCase) >= 0) return all[i];
+            }
+            return null;
+        }
+
+        public static bool PktMonExists()
+        {
+            try
+            {
+                string p = Path.Combine(Environment.SystemDirectory, "PktMon.exe");
+                if (File.Exists(p)) return true;
+            }
+            catch { }
+            return File.Exists(@"C:\Windows\System32\PktMon.exe");
+        }
+
+        public static Evidence Run(string adapter, int seconds, Action<string> log, CancellationToken token)
+        {
+            if (seconds < 3) seconds = 3;
+            Evidence ev = new Evidence();
+            ev.Adapter = adapter == null ? "" : adapter;
+            ev.Seconds = seconds;
+            NetworkInterface ni = FindAdapter(adapter);
+            if (ni == null)
+            {
+                ev.Status = "未找到";
+                ev.Verdict = "找不到网卡「" + ev.Adapter + "」，请检查名称（控制面板 → 网络连接）。";
+                if (log != null) log(ev.Verdict);
+                return ev;
+            }
+            ev.Status = ni.OperationalStatus.ToString();
+            ev.Type = ni.NetworkInterfaceType.ToString();
+            try { ev.SpeedMbps = ni.Speed / 1000000L; }
+            catch { }
+
+            IPv4InterfaceStatistics s0 = ni.GetIPv4Statistics();
+            ev.RxBytes0 = s0.BytesReceived;
+            ev.RxPackets0 = s0.UnicastPacketsReceived + s0.NonUnicastPacketsReceived;
+            ev.TxBytes0 = s0.BytesSent;
+
+            bool admin = DirectProbe.IsAdministrator();
+            Task<List<Peer>> sniff = null;
+            if (admin && PktMonExists())
+            {
+                if (log != null) log("管理员身份：同时用 pktmon 抓包 " + seconds + " 秒（只看接收方向）");
+                sniff = Task.Factory.StartNew(delegate { return Sniff(ni, seconds, log, token); }, token);
+            }
+            else if (log != null)
+            {
+                log(admin ? "没找到 pktmon，只能采样计数器" : "非管理员：只采样计数器，抓不到对端 MAC");
+            }
+
+            Sleep(seconds * 1000, token);
+
+            IPv4InterfaceStatistics s1 = ni.GetIPv4Statistics();
+            ev.RxBytes1 = s1.BytesReceived;
+            ev.RxPackets1 = s1.UnicastPacketsReceived + s1.NonUnicastPacketsReceived;
+            ev.TxBytes1 = s1.BytesSent;
+
+            if (sniff != null)
+            {
+                try
+                {
+                    ev.Peers = sniff.Result;
+                    ev.SniffUsed = true;
+                }
+                catch (Exception ex)
+                {
+                    ev.SniffUsed = false;
+                    if (log != null) log("抓包失败：" + ex.Message);
+                }
+            }
+            ev.Verdict = BuildVerdict(ev);
+            return ev;
+        }
+
+        public static string BuildVerdict(Evidence ev)
+        {
+            if (ev.RxDelta <= 0 && ev.Peers.Count == 0)
+            {
+                return "线上 " + ev.Seconds + " 秒内没有收到任何帧：设备没上电、网线只插了一头、或交换机端口没开。\r\n"
+                     + "如果确认设备已上电，它可能不在 192.168.x（有的设备默认 10.x / 172.16.x / 169.254.x），\r\n"
+                     + "用「直连探测 → 常见私有段」再扫一次。";
+            }
+            if (ev.Peers.Count > 0)
+            {
+                return "线上有 " + ev.Peers.Count + " 个 MAC 在发包（见下方列表），但都不回应当前扫描段的 ARP —— 它们大概率不在这个网段。\r\n"
+                     + "按列表里出现的 IP 把「扫描范围」改成对应网段再扫。";
+            }
+            if (!ev.SniffUsed)
+            {
+                return "线上有流量（" + ev.RxDelta + " 字节 / " + ev.RxPacketsDelta + " 个包），但没抓到对端 MAC：\r\n"
+                     + "抓包需要管理员权限，请以管理员身份重新运行一次体检。";
+            }
+            if (ev.Type != null && ev.Type.IndexOf("Wireless", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return "线上有流量（" + ev.RxDelta + " 字节），但这是无线网卡：WiFi 帧里的 MAC 是接入点/组播地址，不能当作设备 MAC。\r\n"
+                     + "链路体检请对有线网卡做（先在「网络连接」里确认网线插的是哪块网卡）。";
+            }
+            return "线上有流量（" + ev.RxDelta + " 字节 / " + ev.RxPacketsDelta + " 个包），但接收到的帧里没有别的设备 MAC：\r\n"
+                 + "可能只是本机自己在发包（比如 DHCP/组播），也可能抓包被安全软件拦了。";
+        }
+
+        static List<Peer> Sniff(NetworkInterface ni, int seconds, Action<string> log, CancellationToken token)
+        {
+            List<Peer> peers = new List<Peer>();
+            string etl = Path.Combine(Path.GetTempPath(), "lanscanner-sniff.etl");
+            string txt = Path.Combine(Path.GetTempPath(), "lanscanner-sniff.txt");
+            try
+            {
+                TryDelete(etl);
+                TryDelete(txt);
+                RunTool("pktmon", "filter remove");
+                RunTool("pktmon", "start --capture --pkt-size 128 --file-name \"" + etl + "\"");
+                Sleep(seconds * 1000, token);
+                RunTool("pktmon", "stop");
+                if (!File.Exists(etl))
+                {
+                    if (log != null) log("pktmon 没有生成抓包文件（可能被安全软件拦截）");
+                    return peers;
+                }
+                RunTool("pktmon", "format \"" + etl + "\" -o \"" + txt + "\"");
+                if (!File.Exists(txt))
+                {
+                    if (log != null) log("pktmon 转换抓包文件失败");
+                    return peers;
+                }
+                peers = ParseSniff(txt, ni, log);
+            }
+            catch (Exception ex)
+            {
+                if (log != null) log("抓包异常：" + ex.Message);
+            }
+            finally
+            {
+                RunTool("pktmon", "filter remove");
+                TryDelete(etl);
+                TryDelete(txt);
+            }
+            return peers;
+        }
+
+        internal static List<Peer> ParseSniff(string txt, NetworkInterface ni, Action<string> log)
+        {
+            List<Peer> peers = new List<Peer>();
+            HashSet<string> seen = new HashSet<string>();
+            HashSet<string> local = LocalMacSet();
+
+            string[] lines = File.ReadAllLines(txt);
+            bool rx = false;
+            bool eth = false;
+            int events = 0;
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string line = lines[i];
+                if (IsSniffHeader(line))
+                {
+                    events++;
+                    rx = Regex.IsMatch(line, @"(方向|Direction)\s*Rx");
+                    eth = Regex.IsMatch(line, @"(类型|Type)\s*(Ethernet|以太网)", RegexOptions.IgnoreCase);
+                    continue;
+                }
+                if (!rx || !eth) continue;
+                if (line.IndexOf("SA:", StringComparison.Ordinal) < 0) continue;
+                StringBuilder body = new StringBuilder(line);
+                for (int j = i + 1; j < lines.Length && j <= i + 2; j++)
+                {
+                    if (IsSniffHeader(lines[j])) break;
+                    body.Append("\n").Append(lines[j]);
+                }
+                string sa = MatchMac(body.ToString(), "SA:");
+                if (sa.Length == 0) continue;
+                if (!IsUnicastMac(sa)) continue;
+                if (local.Contains(sa)) continue;
+                if (seen.Contains(sa)) continue;
+                seen.Add(sa);
+                Peer peer = new Peer();
+                peer.Mac = sa;
+                peer.Vendor = Oui.Lookup(sa);
+                peer.Ip = MatchIp(body.ToString());
+                peers.Add(peer);
+                if (peers.Count >= 60) break;
+            }
+            if (log != null) log("抓包事件 " + events + " 条，对端 MAC " + peers.Count + " 个");
+            return peers;
+        }
+
+        static bool IsSniffHeader(string line)
+        {
+            return line != null && line.IndexOf("PktGroupId", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        static int MatchNumber(string text, string pattern)
+        {
+            Match m = Regex.Match(text, pattern);
+            if (!m.Success) return -1;
+            int v;
+            if (int.TryParse(m.Groups[2].Value, out v)) return v;
+            return -1;
+        }
+
+        static bool IsUnicastMac(string mac)
+        {
+            if (mac == null || mac.Length < 2) return false;
+            int v;
+            if (!int.TryParse(mac.Substring(0, 2), System.Globalization.NumberStyles.HexNumber, null, out v)) return false;
+            return (v & 0x01) == 0;
+        }
+
+        static string MatchMac(string text, string label)
+        {
+            Match m = Regex.Match(text, label + @"([0-9A-Fa-f]{2}(?:-[0-9A-Fa-f]{2}){5})");
+            if (!m.Success) return "";
+            return m.Groups[1].Value.Replace('-', ':').ToUpperInvariant();
+        }
+
+        static string MatchIp(string text)
+        {
+            Match m = Regex.Match(text, @"(\d{1,3}(?:\.\d{1,3}){3})(?:\.\d{1,5})?\s*>");
+            if (!m.Success) return "";
+            return m.Groups[1].Value;
+        }
+
+        static HashSet<string> LocalMacSet()
+        {
+            HashSet<string> set = new HashSet<string>();
+            try
+            {
+                NetworkInterface[] all = NetworkInterface.GetAllNetworkInterfaces();
+                for (int i = 0; i < all.Length; i++)
+                {
+                    try
+                    {
+                        PhysicalAddress pa = all[i].GetPhysicalAddress();
+                        if (pa == null) continue;
+                        byte[] b = pa.GetAddressBytes();
+                        if (b == null || b.Length < 6) continue;
+                        StringBuilder sb = new StringBuilder();
+                        for (int k = 0; k < 6; k++)
+                        {
+                            if (k > 0) sb.Append(":");
+                            sb.Append(b[k].ToString("X2"));
+                        }
+                        set.Add(sb.ToString());
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+            return set;
+        }
+
+        static void RunTool(string exe, string args)
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo();
+                psi.FileName = exe;
+                psi.Arguments = args;
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                using (Process p = Process.Start(psi))
+                {
+                    if (p == null) return;
+                    p.StandardOutput.ReadToEnd();
+                    p.StandardError.ReadToEnd();
+                    if (!p.WaitForExit(20000))
+                    {
+                        try { p.Kill(); }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        static void TryDelete(string path)
+        {
+            try { if (File.Exists(path)) File.Delete(path); }
+            catch { }
+        }
+
+        static void Sleep(int ms, CancellationToken token)
+        {
+            int left = ms;
+            while (left > 0)
+            {
+                if (token.IsCancellationRequested) return;
+                int step = left > 100 ? 100 : left;
+                Thread.Sleep(step);
+                left -= step;
+            }
         }
     }
 }

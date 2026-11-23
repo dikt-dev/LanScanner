@@ -28,6 +28,7 @@ namespace LanScanner
         Button btnStop;
         Button btnExport;
         Button btnProbe;
+        Button btnLinkCheck;
         Button btnLocal;
         Button btnPick;
         Button btnAll16;
@@ -185,6 +186,12 @@ namespace LanScanner
             btnProbe.Click += new EventHandler(btnProbe_Click);
             top.Controls.Add(btnProbe);
 
+            btnLinkCheck = new Button();
+            btnLinkCheck.Text = "链路体检";
+            btnLinkCheck.SetBounds(776, 84, 92, 26);
+            btnLinkCheck.Click += new EventHandler(btnLinkCheck_Click);
+            top.Controls.Add(btnLinkCheck);
+
             Label lblConc = new Label();
             lblConc.Text = "并发";
             lblConc.SetBounds(10, 52, 44, 20);
@@ -249,6 +256,7 @@ namespace LanScanner
             tips.SetToolTip(cmbRange, "可直接输入：192.168.0.0/16、192.168.1.*、192.168.1.1-254，多段用逗号分隔。点“选择...”可以勾选本机所在的网段。");
             tips.SetToolTip(btnPick, "勾选本机检测到的网段，不用记 CIDR 写法");
             if (btnProbe != null) tips.SetToolTip(btnProbe, "设备 IP 不知道、网线直连：按「扫描范围」临时给网卡加同段地址做 ARP 扫描，结束后自动还原（需管理员）");
+            if (btnLinkCheck != null) tips.SetToolTip(btnLinkCheck, "采样 30 秒看网卡到底有没有收到帧；管理员身份下用系统自带 pktmon 抓包，能看到线上发包的对端 MAC");
             tips.SetToolTip(btnLocal, "只填入本机所在的一个 /24 段（最常用）");
             tips.SetToolTip(btnAll16, "填入 192.168.0.0/16，扫满 6 万多个地址");
             tips.SetToolTip(numConc, "同时在飞的 ping 数量。局域网 512 很稳；设备弱（老交换机/无线桥接）降到 128");
@@ -274,7 +282,7 @@ namespace LanScanner
             top.Controls.Add(btnClearFilter);
 
             lblCount = new Label();
-            lblCount.SetBounds(492, 90, 380, 20);
+            lblCount.SetBounds(492, 90, 276, 20);
             lblCount.ForeColor = Color.DimGray;
             lblCount.Text = "显示 0 台";
             top.Controls.Add(lblCount);
@@ -635,30 +643,49 @@ namespace LanScanner
                 MessageBox.Show(this, "没有找到已连接的有线网卡（无线网卡不能用于直连探测）。", "无法探测", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
-            // 探测段取自「扫描范围」：范围写 /16 就是全 256 段；范围为空才退回默认 12 段
-            List<string> cidrs = DirectProbe.SegmentsFromRange(cmbRange.Text);
-            bool fromRange = cidrs.Count > 0;
-            if (!fromRange)
+            // 先选探测段来源：扫描范围 / 192.168.x 全段 / 常见私有段
+            string preset = ProbePresets.Range;
+            using (ProbeScopeForm dlg = new ProbeScopeForm(cmbRange.Text))
             {
-                string rt = cmbRange.Text == null ? "" : cmbRange.Text.Trim();
-                if (rt.Length > 0)
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                preset = dlg.Preset;
+            }
+            List<string> cidrs;
+            string sourceText;
+            if (preset == ProbePresets.Range)
+            {
+                cidrs = DirectProbe.SegmentsFromRange(cmbRange.Text);
+                if (cidrs.Count == 0)
                 {
-                    MessageBox.Show(this, "「扫描范围」里的「" + rt + "」解析不出可探测的网段（可能格式有误或范围太大）。\n\n请先改正范围，或者清空范围后用默认 12 段。", "无法探测", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    return;
+                    string rt = cmbRange.Text == null ? "" : cmbRange.Text.Trim();
+                    if (rt.Length > 0)
+                    {
+                        MessageBox.Show(this, "「扫描范围」里的「" + rt + "」解析不出可探测的网段（可能格式有误或范围太大）。\n\n请先改正范围，或者在「选择探测范围」里改选 192.168.x 全段。", "无法探测", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return;
+                    }
+                    cidrs = new List<string>(DirectProbe.DefaultCandidates());
+                    sourceText = "扫描范围为空，使用默认 12 段：";
                 }
-                cidrs = new List<string>(DirectProbe.DefaultCandidates());
+                else
+                {
+                    sourceText = "探测段来自「扫描范围」：";
+                }
+            }
+            else
+            {
+                cidrs = ProbePresets.ForPreset(preset, null);
+                sourceText = "探测段来自「" + ProbePresets.Label(preset) + "」：";
             }
             if (cidrs.Count == 0)
             {
-                MessageBox.Show(this, "「扫描范围」里没有可探测的网段。请填 192.168.0.0/16、192.168.*.0/24 或 192.168.1.0/24 这样的范围。", "无法探测", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show(this, "没有解析出可探测的网段。请填 192.168.0.0/16、192.168.*.0/24 或 192.168.1.0/24 这样的范围。", "无法探测", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
-            double secs = cidrs.Count * 0.75;
-            string eta = secs >= 60 ? ((int)Math.Round(secs / 60.0)) + " 分钟" : ((int)Math.Round(secs)) + " 秒";
+            string eta = ProbePresets.Eta(cidrs.Count);
             string head = string.Join("、", cidrs.GetRange(0, Math.Min(6, cidrs.Count)).ToArray());
             if (cidrs.Count > 6) head += " …";
             string ask = "将在网卡「" + adapter + "」上依次临时添加 " + cidrs.Count + " 个网段的地址（如 192.168.1.250），对每段做 ARP 扫描，结束后自动删除临时地址并还原网卡配置。\n\n"
-                + (fromRange ? "探测段来自「扫描范围」：" : "扫描范围为空，使用默认 12 段：")
+                + sourceText
                 + head + "\n\n预计约 " + eta + "，期间该网卡会短暂断网。继续吗？";
             if (MessageBox.Show(this, ask, "探测直连设备", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
             probeSegments = cidrs.Count;
@@ -730,6 +757,99 @@ namespace LanScanner
                 Log("0 台：这些段里没有设备回应 ARP —— 设备可能不在这些段，或不在同一广播域（中间有交换机隔离/路由器）。");
                 Log("可以点「整个 /16」把扫描范围设成 192.168.0.0/16 再探测一次（覆盖 256 个段，约 3 分钟）。");
             }
+        }
+
+        void btnLinkCheck_Click(object sender, EventArgs e)
+        {
+            if (running) return;
+            string adapter = DirectProbe.DefaultAdapter();
+            if (adapter == null)
+            {
+                MessageBox.Show(this, "没有找到已连接的有线网卡。\n\n链路体检目前只支持有线网卡（无线网卡抓到的对端 MAC 没有意义）。", "无法体检", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            bool admin = DirectProbe.IsAdministrator();
+            int seconds = 30;
+            string ask = "将对网卡「" + adapter + "」采样 " + seconds + " 秒，期间不改动任何网络配置。\n\n"
+                + (admin ? "同时用系统自带 pktmon 抓包，能看到线上发包的对端 MAC。" : "当前不是管理员，只能看到收发了多少字节，看不到对端 MAC。建议关掉程序后右键「以管理员身份运行」。")
+                + "\n\n继续吗？";
+            if (MessageBox.Show(this, ask, "链路体检", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            running = true;
+            SetBusy(true);
+            bar.Style = ProgressBarStyle.Marquee;
+            bar.Value = 0;
+            lblStatus.Text = "链路体检中…（" + seconds + " 秒，不改配置）";
+            started = DateTime.Now;
+            cts = new CancellationTokenSource();
+            CancellationTokenSource local = cts;
+            Log("链路体检：" + adapter + "，采样 " + seconds + " 秒" + (admin ? " + pktmon 抓包" : "（无管理员，不抓包）"));
+            Action<string> push = delegate(string s)
+            {
+                if (IsDisposed) return;
+                try
+                {
+                    if (IsHandleCreated) BeginInvoke(new MethodInvoker(delegate { Log(s); }));
+                }
+                catch { }
+            };
+            Task<LinkCheck.Evidence> work = Task.Run(delegate
+            {
+                return LinkCheck.Run(adapter, seconds, push, local.Token);
+            });
+            work.ContinueWith(delegate(Task<LinkCheck.Evidence> done)
+            {
+                if (IsDisposed) return;
+                try { BeginInvoke(new MethodInvoker(delegate { LinkCheckFinished(done); })); }
+                catch { }
+            });
+        }
+
+        void LinkCheckFinished(Task<LinkCheck.Evidence> work)
+        {
+            bar.Style = ProgressBarStyle.Blocks;
+            bar.Value = 0;
+            running = false;
+            SetBusy(false);
+            if (work.IsFaulted)
+            {
+                string msg = work.Exception == null ? "未知错误" : work.Exception.GetBaseException().Message;
+                Log("链路体检失败：" + msg);
+                lblStatus.Text = "链路体检失败";
+                return;
+            }
+            LinkCheck.Evidence ev = work.Result;
+            Log("网卡 " + ev.Adapter + "：" + ev.Status + "，" + ev.SpeedMbps + " Mbps");
+            Log("接收 " + ev.RxDelta + " 字节 / " + ev.RxPacketsDelta + " 包，发送 " + ev.TxDelta + " 字节");
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("网卡：" + ev.Adapter + "（" + ev.Status + "，" + ev.SpeedMbps + " Mbps）");
+            sb.AppendLine("采样：" + ev.Seconds + " 秒");
+            sb.AppendLine("接收：" + ev.RxDelta + " 字节 / " + ev.RxPacketsDelta + " 个包");
+            sb.AppendLine("发送：" + ev.TxDelta + " 字节");
+            sb.AppendLine("抓包：" + (ev.SniffUsed ? "已用 pktmon 抓包" : "未抓包（非管理员或 pktmon 不可用）"));
+            sb.AppendLine();
+            if (ev.Peers.Count == 0)
+            {
+                sb.AppendLine("线上对端 MAC：无");
+            }
+            else
+            {
+                sb.AppendLine("线上对端 MAC（" + ev.Peers.Count + " 个）：");
+                int max = Math.Min(10, ev.Peers.Count);
+                for (int i = 0; i < max; i++)
+                {
+                    LinkCheck.Peer p = ev.Peers[i];
+                    sb.AppendLine("  " + p.Mac + "  " + p.Vendor + (p.Ip.Length > 0 ? "  " + p.Ip : ""));
+                    Log("对端 " + p.Mac + " " + p.Vendor + (p.Ip.Length > 0 ? " " + p.Ip : ""));
+                }
+                if (ev.Peers.Count > max) sb.AppendLine("  …还有 " + (ev.Peers.Count - max) + " 个");
+            }
+            sb.AppendLine();
+            sb.AppendLine("结论：");
+            sb.AppendLine(ev.Verdict);
+            lblStatus.Text = ev.Peers.Count > 0
+                ? string.Format("链路体检：线上 {0} 个 MAC", ev.Peers.Count)
+                : (ev.RxDelta > 0 ? "链路体检：有流量但没抓到 MAC" : "链路体检：线上无帧");
+            MessageBox.Show(this, sb.ToString(), "链路体检结果", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
         void btnStart_Click(object sender, EventArgs e)
@@ -1269,6 +1389,20 @@ namespace LanScanner
                 }
                 return;
             }
+            if (args.Length > 0 && (args[0] == "--linkcheck" || args[0] == "/linkcheck"))
+            {
+                try
+                {
+                    RunLinkCheck(args);
+                }
+                catch (Exception ex)
+                {
+                    try { File.WriteAllText(Path.Combine(Path.GetTempPath(), "LanScanner-linkcheck.txt"), "ERROR=" + ex.ToString(), new UTF8Encoding(true)); }
+                    catch { }
+                    Environment.Exit(2);
+                }
+                return;
+            }
             if (args.Length > 0 && (args[0] == "--selftest" || args[0] == "/selftest"))
             {
                 try
@@ -1365,11 +1499,37 @@ namespace LanScanner
         static void RunProbeDirect(string[] args)
         {
             StringBuilder sb = new StringBuilder();
-            string adapter = args.Length > 1 ? args[1] : DirectProbe.DefaultAdapter();
-            List<string> cidrs = new List<string>();
-            if (args.Length > 2 && args[2].Length > 0)
+            bool hasAdapter = args.Length > 1 && !args[1].StartsWith("--");
+            string adapter = hasAdapter ? args[1] : DirectProbe.DefaultAdapter();
+            string preset = null;
+            string cidrArg = null;
+            for (int i = hasAdapter ? 2 : 1; i < args.Length; i++)
             {
-                string[] parts = args[2].Split(',');
+                if (args[i] == "--preset" && i + 1 < args.Length)
+                {
+                    preset = args[i + 1];
+                    i++;
+                }
+                else if (!args[i].StartsWith("--") && cidrArg == null)
+                {
+                    cidrArg = args[i];
+                }
+            }
+            if (preset != null && cidrArg != null)
+            {
+                sb.AppendLine("ERROR=--preset 不能和显式网段同时给");
+                File.WriteAllText(Path.Combine(Path.GetTempPath(), "LanScanner-probe-direct.txt"), sb.ToString(), new UTF8Encoding(true));
+                Environment.Exit(2);
+            }
+            List<string> cidrs = new List<string>();
+            if (preset != null)
+            {
+                cidrs.AddRange(ProbePresets.ForPreset(preset, null));
+                sb.AppendLine("PRESET=" + ProbePresets.Label(preset));
+            }
+            else if (cidrArg != null && cidrArg.Length > 0)
+            {
+                string[] parts = cidrArg.Split(',');
                 for (int i = 0; i < parts.Length; i++)
                 {
                     if (parts[i].Trim().Length > 0) cidrs.Add(parts[i].Trim());
@@ -1381,7 +1541,8 @@ namespace LanScanner
             }
             sb.AppendLine("ADAPTER=" + (adapter == null ? "(none)" : adapter));
             sb.AppendLine("ADMIN=" + DirectProbe.IsAdministrator());
-            sb.AppendLine("SEGMENTS=" + string.Join(",", cidrs.ToArray()));
+            sb.AppendLine("SEGMENT_COUNT=" + cidrs.Count);
+            sb.AppendLine("SEGMENTS=" + string.Join(",", cidrs.GetRange(0, Math.Min(8, cidrs.Count)).ToArray()) + (cidrs.Count > 8 ? ",..." : ""));
             if (adapter == null)
             {
                 sb.AppendLine("ERROR=no wired adapter up");
@@ -1402,6 +1563,39 @@ namespace LanScanner
                 sb.AppendLine("AFTER=" + info.CidrList());
             }
             File.WriteAllText(Path.Combine(Path.GetTempPath(), "LanScanner-probe-direct.txt"), sb.ToString(), new UTF8Encoding(true));
+            Environment.Exit(0);
+        }
+
+        static void RunLinkCheck(string[] args)
+        {
+            string adapter = args.Length > 1 && args[1].Length > 0 ? args[1] : DirectProbe.DefaultAdapter();
+            int seconds = 10;
+            if (args.Length > 2)
+            {
+                int v;
+                if (int.TryParse(args[2], out v) && v >= 3) seconds = v;
+            }
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("ADAPTER=" + (adapter == null ? "(none)" : adapter));
+            sb.AppendLine("ADMIN=" + DirectProbe.IsAdministrator());
+            LinkCheck.Evidence ev = LinkCheck.Run(adapter, seconds,
+                delegate(string s) { sb.AppendLine("LOG " + s); }, CancellationToken.None);
+            sb.AppendLine("STATUS=" + ev.Status);
+            sb.AppendLine("SPEED=" + ev.SpeedMbps);
+            sb.AppendLine("SECONDS=" + ev.Seconds);
+            sb.AppendLine("RX0=" + ev.RxBytes0);
+            sb.AppendLine("RX1=" + ev.RxBytes1);
+            sb.AppendLine("RXDELTA=" + ev.RxDelta);
+            sb.AppendLine("RXPACKETS=" + ev.RxPacketsDelta);
+            sb.AppendLine("TXDELTA=" + ev.TxDelta);
+            sb.AppendLine("SNIFF=" + ev.SniffUsed);
+            sb.AppendLine("COUNT=" + ev.Peers.Count);
+            for (int i = 0; i < ev.Peers.Count; i++)
+            {
+                sb.AppendLine("PEERS=" + ev.Peers[i].Mac + "\t" + ev.Peers[i].Vendor + "\t" + ev.Peers[i].Ip);
+            }
+            sb.AppendLine("VERDICT=" + ev.Verdict.Replace("\r\n", " ").Replace("\n", " "));
+            File.WriteAllText(Path.Combine(Path.GetTempPath(), "LanScanner-linkcheck.txt"), sb.ToString(), new UTF8Encoding(true));
             Environment.Exit(0);
         }
 
@@ -1463,6 +1657,83 @@ namespace LanScanner
             File.WriteAllText(Path.Combine(Path.GetTempPath(), "LanScanner-selftest.txt"), sb.ToString(), new UTF8Encoding(true));
             Mark("done");
             Environment.Exit(0);
+        }
+    }
+
+    // 直连探测的段来源选择框
+    public class ProbeScopeForm : Form
+    {
+        public string Preset = "range";
+
+        public ProbeScopeForm(string rangeText)
+        {
+            Text = "选择探测范围";
+            Font = new Font("Microsoft YaHei UI", 9F);
+            ClientSize = new Size(540, 236);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            StartPosition = FormStartPosition.CenterParent;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+
+            int nRange = 0;
+            try { nRange = DirectProbe.SegmentsFromRange(rangeText).Count; }
+            catch { }
+
+            Label tip = new Label();
+            tip.Text = "「直连探测」要临时给网卡加同段地址再发 ARP，先选要扫哪些段：";
+            tip.SetBounds(14, 12, 512, 20);
+            Controls.Add(tip);
+
+            RadioButton rbRange = NewRadio("扫描范围（" + (nRange > 0 ? nRange + " 段" : "未填写，改用默认 12 段") + "）", 14, 40, 512);
+            RadioButton rb16 = NewRadio("192.168.x 全段（256 段，约 3 分钟）", 14, 72, 512);
+            RadioButton rbCommon = NewRadio("常见私有段（1280 段，含 10.x / 172.16.x / 169.254.x，约 16 分钟）", 14, 104, 512);
+            if (nRange > 0) rbRange.Checked = true;
+            else rb16.Checked = true;
+
+            Label warn = new Label();
+            warn.Text = "探测期间该网卡会短暂断网，结束后自动还原配置。";
+            warn.ForeColor = Color.DimGray;
+            warn.SetBounds(14, 140, 512, 20);
+            Controls.Add(warn);
+
+            Button ok = new Button();
+            ok.Text = "开始探测";
+            ok.SetBounds(320, 176, 96, 28);
+            ok.DialogResult = DialogResult.OK;
+            Controls.Add(ok);
+
+            Button cancel = new Button();
+            cancel.Text = "取消";
+            cancel.SetBounds(426, 176, 96, 28);
+            cancel.DialogResult = DialogResult.Cancel;
+            Controls.Add(cancel);
+
+            AcceptButton = ok;
+            CancelButton = cancel;
+
+            rbRange.CheckedChanged += new EventHandler(OnRadio);
+            rb16.CheckedChanged += new EventHandler(OnRadio);
+            rbCommon.CheckedChanged += new EventHandler(OnRadio);
+        }
+
+        RadioButton NewRadio(string text, int x, int y, int w)
+        {
+            RadioButton rb = new RadioButton();
+            rb.Text = text;
+            rb.AutoSize = false;
+            rb.SetBounds(x, y, w, 26);
+            Controls.Add(rb);
+            return rb;
+        }
+
+        void OnRadio(object sender, EventArgs e)
+        {
+            RadioButton rb = sender as RadioButton;
+            if (rb == null || !rb.Checked) return;
+            if (rb.Text.StartsWith("扫描范围")) Preset = ProbePresets.Range;
+            else if (rb.Text.StartsWith("192.168")) Preset = ProbePresets.All16;
+            else Preset = ProbePresets.CommonSeg;
         }
     }
 }
