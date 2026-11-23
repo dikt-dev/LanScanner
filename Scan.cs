@@ -767,4 +767,331 @@ namespace LanScanner
             return rows;
         }
     }
+
+    /// <summary>直连未知 IP 探测：临时给网卡加一个同段地址 → 对整段做 ARP 扫描 → 结束后恢复。</summary>
+    public static class DirectProbe
+    {
+        public class Hit
+        {
+            public string Ip = "";
+            public string Mac = "";
+            public string Vendor = "";
+            public string Segment = "";
+        }
+
+        [DllImport("iphlpapi.dll", ExactSpelling = true)]
+        static extern int SendARP(int destIp, int srcIp, byte[] macAddr, ref int phyAddrLen);
+
+        public static bool IsAdministrator()
+        {
+            try
+            {
+                System.Security.Principal.WindowsIdentity id = System.Security.Principal.WindowsIdentity.GetCurrent();
+                System.Security.Principal.WindowsPrincipal p = new System.Security.Principal.WindowsPrincipal(id);
+                return p.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+            }
+            catch { return false; }
+        }
+
+        public static string[] DefaultCandidates()
+        {
+            return new string[] {
+                "192.168.0.0/24", "192.168.1.0/24", "192.168.2.0/24", "192.168.4.0/24",
+                "192.168.10.0/24", "192.168.16.0/24", "192.168.31.0/24", "192.168.50.0/24",
+                "192.168.100.0/24", "192.168.120.0/24", "192.168.137.0/24", "192.168.254.0/24"
+            };
+        }
+
+        /// <summary>挑一块已连接的非无线网卡；没有就返回 null。</summary>
+        public static string DefaultAdapter()
+        {
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                    if (ni.NetworkInterfaceType == NetworkInterfaceType.Wireless80211) continue;
+                    return ni.Name;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        static string Netsh(string args)
+        {
+            try
+            {
+                System.Diagnostics.ProcessStartInfo psi = new System.Diagnostics.ProcessStartInfo("netsh", args);
+                psi.UseShellExecute = false;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                psi.CreateNoWindow = true;
+                using (System.Diagnostics.Process p = System.Diagnostics.Process.Start(psi))
+                {
+                    string text = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
+                    if (!p.WaitForExit(8000))
+                    {
+                        try { p.Kill(); } catch { }
+                    }
+                    return text;
+                }
+            }
+            catch (Exception ex) { return ex.Message; }
+        }
+
+        static NetworkInterface FindAdapter(string adapter)
+        {
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (string.Equals(ni.Name, adapter, StringComparison.OrdinalIgnoreCase)) return ni;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        static bool HasAddress(string adapter, string ip)
+        {
+            try
+            {
+                NetworkInterface ni = FindAdapter(adapter);
+                if (ni == null) return false;
+                foreach (UnicastIPAddressInformation u in ni.GetIPProperties().UnicastAddresses)
+                {
+                    if (u.Address.ToString() == ip) return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        static HashSet<string> LocalAddresses()
+        {
+            HashSet<string> set = new HashSet<string>();
+            try
+            {
+                foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    foreach (UnicastIPAddressInformation u in ni.GetIPProperties().UnicastAddresses)
+                    {
+                        set.Add(u.Address.ToString());
+                    }
+                }
+            }
+            catch { }
+            return set;
+        }
+
+        /// <summary>对一个 /24 做 ARP 扫描：复用 Engine 的 ICMP+ARP 合并（回 ping 或回 ARP 都算）。</summary>
+        static void Sweep24(string cidr, HashSet<string> local, List<Hit> hits, HashSet<string> seen, CancellationToken token, out int routedOnly)
+        {
+            routedOnly = 0;
+            string baseIp = cidr.Substring(0, cidr.IndexOf('/'));
+            byte[] b = IPAddress.Parse(baseIp).GetAddressBytes();
+            List<uint> addrs = new List<uint>();
+            for (int i = 1; i <= 254; i++)
+            {
+                b[3] = (byte)i;
+                string ip = new IPAddress(b).ToString();
+                if (local.Contains(ip)) continue;
+                addrs.Add(IpUtil.ToUInt(ip));
+            }
+            NetInfo info = new NetInfo();
+            info.Load();
+            Engine eng = new Engine(info);
+            ScanOptions o = new ScanOptions();
+            o.Concurrency = 512;
+            o.TimeoutMs = 200;
+            o.UseArp = true;
+            o.ResolveDns = false;
+            List<HostRow> rows = eng.RunFull(addrs, o, null, null, token).GetAwaiter().GetResult();
+            for (int i = 0; i < rows.Count; i++)
+            {
+                HostRow r = rows[i];
+                if (r.Mac == null) r.Mac = "";
+                // 只认二层证据：拿到 MAC 才是“这条线上”的设备；只有 ping 通的多半是经路由绕过去的
+                if (r.Mac.Length == 0) { if (r.Alive) routedOnly++; continue; }
+                lock (hits)
+                {
+                    if (!seen.Add(r.Ip)) continue;
+                    Hit h = new Hit();
+                    h.Ip = r.Ip;
+                    h.Mac = r.Mac;
+                    h.Vendor = Oui.Lookup(r.Mac);
+                    h.Segment = cidr;
+                    hits.Add(h);
+                }
+            }
+        }
+
+
+        /// <summary>本机是否已有地址落在该 /24 里。</summary>
+        static bool SameSegment(HashSet<string> local, string cidr)
+        {
+            int slash = cidr.IndexOf('/');
+            if (slash <= 0) return false;
+            string baseIp = cidr.Substring(0, slash);
+            int dot = baseIp.LastIndexOf('.');
+            if (dot <= 0) return false;
+            string prefix = baseIp.Substring(0, dot + 1);
+            foreach (string ip in local)
+            {
+                if (ip.StartsWith(prefix, StringComparison.Ordinal) && ip.IndexOf(':') < 0) return true;
+            }
+            return false;
+        }
+
+        /// <summary>读 netsh 的 DHCP 开关（中英文输出都能认）。</summary>
+        static bool GetDhcpEnabled(string adapter)
+        {
+            string text = Netsh("interface ipv4 show config name=\"" + adapter + "\"");
+            if (text == null) return false;
+            string[] lines = text.Replace("\r", "").Split('\n');
+            for (int i = 0; i < lines.Length; i++)
+            {
+                string s = lines[i];
+                if (s.IndexOf("DHCP", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                if (s.IndexOf("enabled", StringComparison.OrdinalIgnoreCase) < 0 && s.IndexOf("启用", StringComparison.Ordinal) < 0) continue;
+                if (s.IndexOf("否", StringComparison.Ordinal) >= 0) return false;
+                if (s.IndexOf("是", StringComparison.Ordinal) >= 0) return true;
+                if (s.IndexOf("No", StringComparison.OrdinalIgnoreCase) >= 0) return false;
+                return true;
+            }
+            return false;
+        }
+
+        static string FirstLine(string s)
+        {
+            if (s == null || s.Length == 0) return "无输出";
+            string[] lines = s.Replace("\r", "").Split('\n');
+            for (int i = 0; i < lines.Length; i++)
+            {
+                if (lines[i].Trim().Length > 0) return lines[i].Trim();
+            }
+            return "无输出";
+        }
+
+        /// <summary>依次给每个候选 /24 加临时地址并 ARP 扫描；finally 里一定删掉临时地址。</summary>
+        /// <summary>支持 192.168.*.0/24、192.168.0-255.0/24 这类通配，展开成逐个 /24。</summary>
+        public static List<string> Expand(List<string> cidrs)
+        {
+            List<string> outList = new List<string>();
+            for (int i = 0; i < cidrs.Count; i++)
+            {
+                string c = cidrs[i] == null ? "" : cidrs[i].Trim();
+                if (c.Length == 0) continue;
+                int slash = c.IndexOf('/');
+                string head = slash > 0 ? c.Substring(0, slash) : c;
+                string[] parts = head.Split('.');
+                if (parts.Length == 4 && (parts[2] == "*" || parts[2] == "0-255"))
+                {
+                    for (int n = 0; n < 256; n++)
+                    {
+                        outList.Add(parts[0] + "." + parts[1] + "." + n + ".0/24");
+                    }
+                    continue;
+                }
+                if (slash < 0) { outList.Add(head + ".0/24"); continue; }
+                outList.Add(c);
+            }
+            return outList;
+        }
+
+        public static List<Hit> Run(string adapter, List<string> cidrs, int concurrency, Action<string> log, CancellationToken token)
+        {
+            cidrs = Expand(cidrs);
+            List<Hit> hits = new List<Hit>();
+            HashSet<string> seen = new HashSet<string>();
+            HashSet<string> local = LocalAddresses();
+            List<string> added = new List<string>();
+            bool wasDhcp = GetDhcpEnabled(adapter);
+            try
+            {
+                for (int i = 0; i < cidrs.Count; i++)
+                {
+                    if (token.IsCancellationRequested) break;
+                    string cidr = cidrs[i] == null ? "" : cidrs[i].Trim();
+                    if (cidr.Length == 0) continue;
+                    int slash = cidr.IndexOf('/');
+                    if (slash <= 0) { if (log != null) log("跳过 " + cidr + "：只支持 x.x.x.0/24 形式"); continue; }
+                    string baseIp = cidr.Substring(0, slash);
+                    int dot = baseIp.LastIndexOf('.');
+                    if (dot <= 0) { if (log != null) log("跳过 " + cidr + "：地址格式不对"); continue; }
+                    string tempIp = baseIp.Substring(0, dot + 1) + "250";
+                    bool owned = false;
+                    bool alreadyInSegment = SameSegment(local, cidr);
+                    if (alreadyInSegment)
+                    {
+                        if (log != null) log("扫描 " + cidr + "（本机已在该段，无需临时地址）");
+                    }
+                    else if (!local.Contains(tempIp) && !HasAddress(adapter, tempIp))
+                    {
+                        string addText = Netsh("interface ipv4 add address name=\"" + adapter + "\" address=" + tempIp + " mask=255.255.255.0");
+                        bool ok = false;
+                        for (int w = 0; w < 25; w++)
+                        {
+                            if (HasAddress(adapter, tempIp)) { ok = true; break; }
+                            Thread.Sleep(100);
+                        }
+                        if (!ok)
+                        {
+                            if (log != null) log("跳过 " + cidr + "：临时地址 " + tempIp + " 加不上（" + FirstLine(addText) + "）");
+                            continue;
+                        }
+                        added.Add(tempIp);
+                        local.Add(tempIp);
+                        owned = true;
+                        if (log != null) log("临时添加 " + tempIp + "/24 → 扫描 " + cidr);
+                    }
+                    else
+                    {
+                        if (log != null) log("扫描 " + cidr + "（" + tempIp + " 已存在，未改动）");
+                    }
+                    int before = hits.Count;
+                    int routedOnly;
+                    Sweep24(cidr, local, hits, seen, token, out routedOnly);
+                    if (log != null)
+                    {
+                        string extra = routedOnly > 0 ? "（另有 " + routedOnly + " 台只能经路由到达，不算本段）" : "";
+                        log(cidr + " 命中 " + (hits.Count - before) + " 台" + extra);
+                    }
+                    if (owned)
+                    {
+                        Netsh("interface ipv4 delete address name=\"" + adapter + "\" address=" + tempIp);
+                        for (int w = 0; w < 25; w++)
+                        {
+                            if (!HasAddress(adapter, tempIp)) break;
+                            Thread.Sleep(100);
+                        }
+                        added.Remove(tempIp);
+                        local.Remove(tempIp);
+                        if (log != null) log("已移除临时地址 " + tempIp);
+                    }
+                }
+            }
+            finally
+            {
+                for (int i = 0; i < added.Count; i++)
+                {
+                    Netsh("interface ipv4 delete address name=\"" + adapter + "\" address=" + added[i]);
+                    if (log != null) log("已移除临时地址 " + added[i]);
+                }
+                // 加过静态地址后网卡可能被切成“静态”，原来走 DHCP 的要切回去，否则以后拿不到地址
+                if (added.Count > 0 && wasDhcp && !GetDhcpEnabled(adapter))
+                {
+                    Netsh("interface ipv4 set address name=\"" + adapter + "\" source=dhcp");
+                    if (log != null) log("网卡原本是 DHCP，已切回自动获取");
+                }
+            }
+            hits.Sort(delegate(Hit x, Hit y)
+            {
+                return IpUtil.ToUInt(x.Ip).CompareTo(IpUtil.ToUInt(y.Ip));
+            });
+            return hits;
+        }
+    }
 }

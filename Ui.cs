@@ -27,6 +27,7 @@ namespace LanScanner
         Button btnStart;
         Button btnStop;
         Button btnExport;
+        Button btnProbe;
         Button btnLocal;
         Button btnPick;
         Button btnAll16;
@@ -178,6 +179,12 @@ namespace LanScanner
             btnExport.Click += new EventHandler(btnExport_Click);
             top.Controls.Add(btnExport);
 
+            btnProbe = new Button();
+            btnProbe.Text = "直连探测";
+            btnProbe.SetBounds(874, 84, 98, 26);
+            btnProbe.Click += new EventHandler(btnProbe_Click);
+            top.Controls.Add(btnProbe);
+
             Label lblConc = new Label();
             lblConc.Text = "并发";
             lblConc.SetBounds(10, 52, 44, 20);
@@ -241,6 +248,7 @@ namespace LanScanner
             tips.ReshowDelay = 100;
             tips.SetToolTip(cmbRange, "可直接输入：192.168.0.0/16、192.168.1.*、192.168.1.1-254，多段用逗号分隔。点“选择...”可以勾选本机所在的网段。");
             tips.SetToolTip(btnPick, "勾选本机检测到的网段，不用记 CIDR 写法");
+            if (btnProbe != null) tips.SetToolTip(btnProbe, "设备 IP 不知道、网线直连：临时给网卡加同段地址，对常见网段做 ARP 扫描，结束后自动恢复（需管理员）");
             tips.SetToolTip(btnLocal, "只填入本机所在的一个 /24 段（最常用）");
             tips.SetToolTip(btnAll16, "填入 192.168.0.0/16，扫满 6 万多个地址");
             tips.SetToolTip(numConc, "同时在飞的 ping 数量。局域网 512 很稳；设备弱（老交换机/无线桥接）降到 128");
@@ -611,6 +619,97 @@ namespace LanScanner
             ApplyFilter();
         }
 
+        int probeSegments;
+
+        void btnProbe_Click(object sender, EventArgs e)
+        {
+            if (running) return;
+            if (!DirectProbe.IsAdministrator())
+            {
+                MessageBox.Show(this, "直连探测需要临时给网卡加一个同段地址，必须以管理员身份运行。\n\n请关掉程序，右键 LanScanner.exe →「以管理员身份运行」。", "需要管理员权限", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            string adapter = DirectProbe.DefaultAdapter();
+            if (adapter == null)
+            {
+                MessageBox.Show(this, "没有找到已连接的有线网卡（无线网卡不能用于直连探测）。", "无法探测", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            string[] cands = DirectProbe.DefaultCandidates();
+            string ask = "将在网卡「" + adapter + "」上依次临时添加 " + cands.Length + " 个网段的地址（如 192.168.1.250），对每段做 ARP 扫描，结束后自动删除临时地址。\n\n候选段：\n" + string.Join("、", cands) + "\n\n探测期间该网卡上原有的 192.168 通信会短暂中断。继续吗？";
+            if (MessageBox.Show(this, ask, "探测直连设备", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+
+            List<string> cidrs = new List<string>(cands);
+            probeSegments = cidrs.Count;
+            lastRows = new List<HostRow>();
+            grid.Rows.Clear();
+            logBox.Clear();
+            lblCount.Text = "显示 0 台";
+            running = true;
+            SetBusy(true);
+            bar.Style = ProgressBarStyle.Marquee;
+            bar.Value = 0;
+            lblStatus.Text = "直连探测中…（临时改网卡地址，请勿中断）";
+            started = DateTime.Now;
+            cts = new CancellationTokenSource();
+            CancellationTokenSource local = cts;
+            Log("直连探测：" + adapter + "，候选 " + cidrs.Count + " 个段");
+            Action<string> push = delegate(string s)
+            {
+                if (IsDisposed) return;
+                try
+                {
+                    if (IsHandleCreated) BeginInvoke(new MethodInvoker(delegate { Log(s); }));
+                }
+                catch { }
+            };
+            Task<List<DirectProbe.Hit>> work = Task.Run(delegate
+            {
+                return DirectProbe.Run(adapter, cidrs, 128, push, local.Token);
+            });
+            work.ContinueWith(delegate(Task<List<DirectProbe.Hit>> done)
+            {
+                if (IsDisposed) return;
+                try { BeginInvoke(new MethodInvoker(delegate { ProbeFinished(done); })); }
+                catch { }
+            });
+        }
+
+        void ProbeFinished(Task<List<DirectProbe.Hit>> work)
+        {
+            bar.Style = ProgressBarStyle.Blocks;
+            bar.Value = 0;
+            running = false;
+            SetBusy(false);
+            if (work.IsFaulted)
+            {
+                string msg = work.Exception == null ? "未知错误" : work.Exception.GetBaseException().Message;
+                Log("直连探测失败：" + msg);
+                lblStatus.Text = "直连探测失败（临时地址已清理）";
+                return;
+            }
+            List<DirectProbe.Hit> hits = work.Result;
+            lastRows = new List<HostRow>();
+            for (int i = 0; i < hits.Count; i++)
+            {
+                HostRow r = new HostRow();
+                r.Ip = hits[i].Ip;
+                r.Mac = hits[i].Mac;
+                r.Vendor = hits[i].Vendor;
+                r.Alive = false;
+                r.ArpState = "ARP";
+                r.Path = "直连探测";
+                r.Role = "";
+                lastRows.Add(r);
+            }
+            FillGrid(lastRows);
+            lblStatus.Text = string.Format("直连探测完成：{0} 台 · {1} 个段 · 临时地址已移除", hits.Count, probeSegments);
+            if (hits.Count == 0)
+            {
+                Log("0 台：这些候选段里没有设备回应 ARP —— 设备可能不在这些段，或不在同一广播域（中间有交换机隔离/路由器）。");
+            }
+        }
+
         void btnStart_Click(object sender, EventArgs e)
         {
             StartScan();
@@ -862,6 +961,7 @@ namespace LanScanner
             btnPick.Enabled = !busy;
             btnAll16.Enabled = !busy;
             btnClearRange.Enabled = !busy;
+            if (btnProbe != null) btnProbe.Enabled = !busy;
             cmbRange.Enabled = !busy;
             numConc.Enabled = !busy;
             numTimeout.Enabled = !busy;
@@ -1133,6 +1233,20 @@ namespace LanScanner
                 File.WriteAllText(Path.Combine(Path.GetTempPath(), "LanScanner-rangetest.txt"), sb.ToString(), new UTF8Encoding(true));
                 Environment.Exit(0);
             }
+            if (args.Length > 0 && (args[0] == "--probe-direct" || args[0] == "/probe-direct"))
+            {
+                try
+                {
+                    RunProbeDirect(args);
+                }
+                catch (Exception ex)
+                {
+                    try { File.WriteAllText(Path.Combine(Path.GetTempPath(), "LanScanner-probe-direct.txt"), "ERROR=" + ex.ToString(), new UTF8Encoding(true)); }
+                    catch { }
+                    Environment.Exit(2);
+                }
+                return;
+            }
             if (args.Length > 0 && (args[0] == "--selftest" || args[0] == "/selftest"))
             {
                 try
@@ -1224,6 +1338,49 @@ namespace LanScanner
                 File.AppendAllText(ProgressPath, DateTime.Now.ToString("HH:mm:ss.fff") + " " + s + Environment.NewLine, new UTF8Encoding(false));
             }
             catch { }
+        }
+
+        static void RunProbeDirect(string[] args)
+        {
+            StringBuilder sb = new StringBuilder();
+            string adapter = args.Length > 1 ? args[1] : DirectProbe.DefaultAdapter();
+            List<string> cidrs = new List<string>();
+            if (args.Length > 2 && args[2].Length > 0)
+            {
+                string[] parts = args[2].Split(',');
+                for (int i = 0; i < parts.Length; i++)
+                {
+                    if (parts[i].Trim().Length > 0) cidrs.Add(parts[i].Trim());
+                }
+            }
+            else
+            {
+                cidrs.AddRange(DirectProbe.DefaultCandidates());
+            }
+            sb.AppendLine("ADAPTER=" + (adapter == null ? "(none)" : adapter));
+            sb.AppendLine("ADMIN=" + DirectProbe.IsAdministrator());
+            sb.AppendLine("SEGMENTS=" + string.Join(",", cidrs.ToArray()));
+            if (adapter == null)
+            {
+                sb.AppendLine("ERROR=no wired adapter up");
+            }
+            else
+            {
+                DateTime t0 = DateTime.Now;
+                List<DirectProbe.Hit> hits = DirectProbe.Run(adapter, cidrs, 128,
+                    delegate(string s) { sb.AppendLine("LOG " + s); }, CancellationToken.None);
+                sb.AppendLine("ELAPSED=" + (int)(DateTime.Now - t0).TotalSeconds);
+                sb.AppendLine("COUNT=" + hits.Count);
+                for (int i = 0; i < hits.Count; i++)
+                {
+                    sb.AppendLine(string.Join("\t", new string[] { hits[i].Ip, hits[i].Mac, hits[i].Vendor, hits[i].Segment }));
+                }
+                NetInfo info = new NetInfo();
+                info.Load();
+                sb.AppendLine("AFTER=" + info.CidrList());
+            }
+            File.WriteAllText(Path.Combine(Path.GetTempPath(), "LanScanner-probe-direct.txt"), sb.ToString(), new UTF8Encoding(true));
+            Environment.Exit(0);
         }
 
         static void RunSelfTest(string[] args)
