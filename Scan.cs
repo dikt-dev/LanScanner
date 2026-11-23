@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using Microsoft.Win32;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -978,6 +979,66 @@ namespace LanScanner
             return "无输出";
         }
 
+        /// <summary>ping 自己的临时地址：地址从 Tentative 变 Preferred 之后才会回包，用来判断“现在真能用了”。</summary>
+        static bool SelfPing(string ip, int timeoutMs)
+        {
+            try
+            {
+                using (Ping p = new Ping())
+                {
+                    PingReply r = p.Send(ip, timeoutMs);
+                    return r != null && r.Status == IPStatus.Success;
+                }
+            }
+            catch { return false; }
+        }
+
+        static int AdapterIndex(string adapter)
+        {
+            try
+            {
+                NetworkInterface[] all = NetworkInterface.GetAllNetworkInterfaces();
+                for (int i = 0; i < all.Length; i++)
+                {
+                    if (!string.Equals(all[i].Name, adapter, StringComparison.OrdinalIgnoreCase)) continue;
+                    IPv4InterfaceProperties p = all[i].GetIPProperties().GetIPv4Properties();
+                    if (p != null) return p.Index;
+                }
+            }
+            catch { }
+            return -1;
+        }
+
+        /// <summary>读网卡的 DAD 传输次数；-1 表示注册表没写（系统默认 3）。</summary>
+        static int GetDadTransmits(string adapter)
+        {
+            try
+            {
+                string id = null;
+                NetworkInterface[] all = NetworkInterface.GetAllNetworkInterfaces();
+                for (int i = 0; i < all.Length; i++)
+                {
+                    if (string.Equals(all[i].Name, adapter, StringComparison.OrdinalIgnoreCase)) { id = all[i].Id; break; }
+                }
+                if (id == null) return -1;
+                using (RegistryKey k = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\" + id))
+                {
+                    if (k == null) return -1;
+                    object v = k.GetValue("DadTransmits");
+                    if (v == null) return -1;
+                    return Convert.ToInt32(v);
+                }
+            }
+            catch { return -1; }
+        }
+
+        static void SetDadTransmits(string adapter, int value)
+        {
+            int idx = AdapterIndex(adapter);
+            if (idx < 0) return;
+            Netsh("interface ipv4 set interface " + idx + " dadtransmits=" + value);
+        }
+
         /// <summary>依次给每个候选 /24 加临时地址并 ARP 扫描；finally 里一定删掉临时地址。</summary>
         /// <summary>支持 192.168.*.0/24、192.168.0-255.0/24 这类通配，展开成逐个 /24。</summary>
         public static List<string> Expand(List<string> cidrs)
@@ -1197,6 +1258,16 @@ namespace LanScanner
             List<string> added = new List<string>();
             bool wasDhcp = GetDhcpEnabled(adapter);
             IfSnapshot snapshot = SnapshotIf(adapter);
+            // 关掉地址冲突检测（DAD）：开着时新加的地址要 2~3 秒才从 Tentative 变 Preferred，
+            // 这期间没有 on-link 路由，扫描包会从默认路由（WLAN/网关）绕出去，结果必然 0 命中。
+            int dadBefore = GetDadTransmits(adapter);
+            bool dadChanged = false;
+            if (dadBefore != 0)
+            {
+                SetDadTransmits(adapter, 0);
+                dadChanged = true;
+                if (log != null) log("探测期间临时关闭地址冲突检测（DAD），结束自动恢复（原值 " + (dadBefore < 0 ? "默认 3" : dadBefore.ToString()) + "）");
+            }
             bool touched = false;   // 是否真的改过网卡：added 会在每段结束时清空，不能拿它当依据
             try
             {
@@ -1220,15 +1291,19 @@ namespace LanScanner
                     else if (!local.Contains(tempIp) && !HasAddress(adapter, tempIp))
                     {
                         string addText = Netsh("interface ipv4 add address name=\"" + adapter + "\" address=" + tempIp + " mask=255.255.255.0");
+                        // 光看“地址在不在”不够：刚加的地址是 Tentative，自 ping 不通、也没有 on-link 路由。
                         bool ok = false;
-                        for (int w = 0; w < 25; w++)
+                        int waitedMs = 0;
+                        for (int w = 0; w < 80; w++)
                         {
-                            if (HasAddress(adapter, tempIp)) { ok = true; break; }
-                            Thread.Sleep(100);
+                            if (HasAddress(adapter, tempIp) && SelfPing(tempIp, 150)) { ok = true; break; }
+                            Thread.Sleep(50);
+                            waitedMs += 50;
                         }
                         if (!ok)
                         {
-                            if (log != null) log("跳过 " + cidr + "：临时地址 " + tempIp + " 加不上（" + FirstLine(addText) + "）");
+                            if (log != null) log("跳过 " + cidr + "：临时地址 " + tempIp + " 没有生效（" + FirstLine(addText) + "；可能是本段已有 .250 或地址冲突检测未通过）");
+                            Netsh("interface ipv4 delete address name=\"" + adapter + "\" address=" + tempIp);
                             continue;
                         }
                         added.Add(tempIp);
@@ -1292,6 +1367,11 @@ namespace LanScanner
                 {
                     // 原本是静态配置：把探测前的地址/网关按快照加回去
                     if (snapshot.HasAddress) RestoreIf(adapter, snapshot, log);
+                }
+                if (dadChanged)
+                {
+                    SetDadTransmits(adapter, dadBefore < 0 ? 3 : dadBefore);
+                    if (log != null) log("已恢复地址冲突检测（DAD=" + (dadBefore < 0 ? 3 : dadBefore) + "）");
                 }
             }
             hits.Sort(delegate(Hit x, Hit y)
