@@ -987,11 +987,21 @@ namespace LanScanner
                 int slash = c.IndexOf('/');
                 string head = slash > 0 ? c.Substring(0, slash) : c;
                 string[] parts = head.Split('.');
-                if (parts.Length == 4 && (parts[2] == "*" || parts[2] == "0-255"))
+                // 第三段通配：192.168.*.0/24 → 256 个 /24
+                if (parts.Length == 4 && (parts[2] == "*" || parts[2] == "0-255") && parts[1] != "*" && parts[1] != "0-255")
                 {
                     for (int n = 0; n < 256; n++)
                     {
                         outList.Add(parts[0] + "." + parts[1] + "." + n + ".0/24");
+                    }
+                    continue;
+                }
+                // 第二段通配：10.*.0/24 → 256 个 /24
+                if (parts.Length == 4 && (parts[1] == "*" || parts[1] == "0-255"))
+                {
+                    for (int n = 0; n < 256; n++)
+                    {
+                        outList.Add(parts[0] + "." + n + "." + parts[2] + ".0/24");
                     }
                     continue;
                 }
