@@ -968,6 +968,25 @@ namespace LanScanner
             return false;
         }
 
+        /// <summary>DNS 是否也是自动获取（由 DHCP 下发）。netsh 输出中英文都认。</summary>
+        static bool GetDnsDhcp(string adapter)
+        {
+            string text = Netsh("interface ipv4 show dnsservers name=\"" + adapter + "\"");
+            if (text == null) return false;
+            return text.IndexOf("DHCP", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        /// <summary>快照里是否只有 169.254 地址（说明网卡被留成了“手动 + APIPA”这种半残状态）。</summary>
+        static bool AllApipa(IfSnapshot snapshot)
+        {
+            if (snapshot == null) return true;
+            for (int i = 0; i < snapshot.Addresses.Count; i++)
+            {
+                if (!snapshot.Addresses[i].StartsWith("169.254.", StringComparison.Ordinal)) return false;
+            }
+            return true;
+        }
+
         static string FirstLine(string s)
         {
             if (s == null || s.Length == 0) return "无输出";
@@ -1195,12 +1214,15 @@ namespace LanScanner
         static void RestoreIf(string adapter, IfSnapshot snapshot, Action<string> log)
         {
             bool first = true;
+            int restored = 0;
             for (int i = 0; i < snapshot.Addresses.Count; i++)
             {
                 string a = snapshot.Addresses[i];
                 int slash = a.IndexOf('/');
                 if (slash <= 0) continue;
                 string ip = a.Substring(0, slash);
+                // 169.254 是 Windows 自己分配的临时地址，不能当静态地址加回去（会把网卡钉成“手动”）
+                if (ip.StartsWith("169.254.", StringComparison.Ordinal)) continue;
                 int prefix;
                 if (!int.TryParse(a.Substring(slash + 1), out prefix)) continue;
                 string mask = MaskFromPrefix(prefix);
@@ -1216,6 +1238,14 @@ namespace LanScanner
                 {
                     Netsh("interface ipv4 add address name=\"" + adapter + "\" address=" + ip + " mask=" + mask);
                 }
+                restored++;
+            }
+            if (restored == 0)
+            {
+                // 探测前就没有真正的静态地址（只有 APIPA）：改回自动获取才是原样
+                Netsh("interface ipv4 set address name=\"" + adapter + "\" source=dhcp");
+                if (log != null) log("探测前网卡只有 169.254 地址，已改回自动获取");
+                return;
             }
             if (log != null) log("已按探测前的配置还原网卡（" + string.Join(", ", snapshot.Addresses.ToArray()) + "）");
         }
@@ -1258,6 +1288,19 @@ namespace LanScanner
             List<string> added = new List<string>();
             bool wasDhcp = GetDhcpEnabled(adapter);
             IfSnapshot snapshot = SnapshotIf(adapter);
+            bool dnsDhcp = GetDnsDhcp(adapter);
+            // 以前某次探测可能把网卡留成“手动 + 169.254 地址”（DHCP 还原超时时把 APIPA 当静态加回去造成的）。
+            // 这种状态不是用户要的，先改回自动获取，免得越修越乱。
+            if (!wasDhcp && AllApipa(snapshot))
+            {
+                Netsh("interface ipv4 set address name=\"" + adapter + "\" source=dhcp");
+                Netsh("interface ipv4 set dnsservers name=\"" + adapter + "\" source=dhcp");
+                Thread.Sleep(2000);
+                wasDhcp = true;
+                dnsDhcp = true;
+                snapshot = SnapshotIf(adapter);
+                if (log != null) log("网卡原来被留成手动 169.254 地址，已先改回自动获取");
+            }
             // 关掉地址冲突检测（DAD）：开着时新加的地址要 2~3 秒才从 Tentative 变 Preferred，
             // 这期间没有 on-link 路由，扫描包会从默认路由（WLAN/网关）绕出去，结果必然 0 命中。
             int dadBefore = GetDadTransmits(adapter);
@@ -1345,28 +1388,43 @@ namespace LanScanner
                     Netsh("interface ipv4 delete address name=\"" + adapter + "\" address=" + added[i]);
                     if (log != null) log("已移除临时地址 " + added[i]);
                 }
-                // 加过静态地址后网卡会被切成“静态”，原来走 DHCP 的必须切回去，否则以后拿不到地址
+                // 加过静态地址后网卡会被切成“静态”，原来走 DHCP 的必须切回去（IP 和 DNS 都要切），否则以后拿不到地址
                 if (touched && wasDhcp)
                 {
                     Netsh("interface ipv4 set address name=\"" + adapter + "\" source=dhcp");
-                    string got = WaitUsableAddress(adapter, 20000);
+                    if (dnsDhcp) Netsh("interface ipv4 set dnsservers name=\"" + adapter + "\" source=dhcp");
+                    string got = WaitUsableAddress(adapter, 4000);   // 有 DHCP 时通常 1~2 秒就有地址，没有就别干等
                     if (got != null)
                     {
                         if (log != null) log("网卡已恢复自动获取，当前地址 " + got);
                     }
                     else
                     {
-                        if (log != null) log("网卡已切回自动获取，但 20 秒内没拿到地址（DHCP 服务器没响应）");
-                        if (snapshot.HasAddress)
-                        {
-                            RestoreIf(adapter, snapshot, log);
-                        }
+                        // 这根线上没有 DHCP 服务器时，千万不要拿 APIPA 快照去“还原”：
+                        // 那会用 set address ... static 169.254.x.x 把网卡钉成手动配置。
+                        if (log != null) log("网卡已切回自动获取（这根线上没有 DHCP 服务器，Windows 会自己分配 169.254 地址）");
                     }
                 }
                 else if (touched && !wasDhcp)
                 {
                     // 原本是静态配置：把探测前的地址/网关按快照加回去
                     if (snapshot.HasAddress) RestoreIf(adapter, snapshot, log);
+                    if (dnsDhcp) Netsh("interface ipv4 set dnsservers name=\"" + adapter + "\" source=dhcp");
+                }
+                // 清掉以前被中途终止的探测留下的 .250 临时地址（只动本工具自己的写法，且不在快照里）
+                for (int i = 0; i < cidrs.Count; i++)
+                {
+                    string c = cidrs[i] == null ? "" : cidrs[i].Trim();
+                    int sl = c.IndexOf('/');
+                    if (sl <= 0) continue;
+                    string b = c.Substring(0, sl);
+                    int d = b.LastIndexOf('.');
+                    if (d <= 0) continue;
+                    string leftover = b.Substring(0, d + 1) + "250";
+                    if (snapshot.Addresses.Contains(leftover + "/24")) continue;
+                    if (!HasAddress(adapter, leftover)) continue;
+                    Netsh("interface ipv4 delete address name=\"" + adapter + "\" address=" + leftover);
+                    if (log != null) log("已清理上次探测遗留的临时地址 " + leftover);
                 }
                 if (dadChanged)
                 {
