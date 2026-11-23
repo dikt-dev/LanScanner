@@ -248,7 +248,7 @@ namespace LanScanner
             tips.ReshowDelay = 100;
             tips.SetToolTip(cmbRange, "可直接输入：192.168.0.0/16、192.168.1.*、192.168.1.1-254，多段用逗号分隔。点“选择...”可以勾选本机所在的网段。");
             tips.SetToolTip(btnPick, "勾选本机检测到的网段，不用记 CIDR 写法");
-            if (btnProbe != null) tips.SetToolTip(btnProbe, "设备 IP 不知道、网线直连：临时给网卡加同段地址，对常见网段做 ARP 扫描，结束后自动恢复（需管理员）");
+            if (btnProbe != null) tips.SetToolTip(btnProbe, "设备 IP 不知道、网线直连：按「扫描范围」临时给网卡加同段地址做 ARP 扫描，结束后自动还原（需管理员）");
             tips.SetToolTip(btnLocal, "只填入本机所在的一个 /24 段（最常用）");
             tips.SetToolTip(btnAll16, "填入 192.168.0.0/16，扫满 6 万多个地址");
             tips.SetToolTip(numConc, "同时在飞的 ping 数量。局域网 512 很稳；设备弱（老交换机/无线桥接）降到 128");
@@ -635,11 +635,32 @@ namespace LanScanner
                 MessageBox.Show(this, "没有找到已连接的有线网卡（无线网卡不能用于直连探测）。", "无法探测", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
-            string[] cands = DirectProbe.DefaultCandidates();
-            string ask = "将在网卡「" + adapter + "」上依次临时添加 " + cands.Length + " 个网段的地址（如 192.168.1.250），对每段做 ARP 扫描，结束后自动删除临时地址。\n\n候选段：\n" + string.Join("、", cands) + "\n\n探测期间该网卡上原有的 192.168 通信会短暂中断。继续吗？";
+            // 探测段取自「扫描范围」：范围写 /16 就是全 256 段；范围为空才退回默认 12 段
+            List<string> cidrs = DirectProbe.SegmentsFromRange(cmbRange.Text);
+            bool fromRange = cidrs.Count > 0;
+            if (!fromRange)
+            {
+                string rt = cmbRange.Text == null ? "" : cmbRange.Text.Trim();
+                if (rt.Length > 0)
+                {
+                    MessageBox.Show(this, "「扫描范围」里的「" + rt + "」解析不出可探测的网段（可能格式有误或范围太大）。\n\n请先改正范围，或者清空范围后用默认 12 段。", "无法探测", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+                cidrs = new List<string>(DirectProbe.DefaultCandidates());
+            }
+            if (cidrs.Count == 0)
+            {
+                MessageBox.Show(this, "「扫描范围」里没有可探测的网段。请填 192.168.0.0/16、192.168.*.0/24 或 192.168.1.0/24 这样的范围。", "无法探测", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            double secs = cidrs.Count * 0.75;
+            string eta = secs >= 60 ? ((int)Math.Round(secs / 60.0)) + " 分钟" : ((int)Math.Round(secs)) + " 秒";
+            string head = string.Join("、", cidrs.GetRange(0, Math.Min(6, cidrs.Count)).ToArray());
+            if (cidrs.Count > 6) head += " …";
+            string ask = "将在网卡「" + adapter + "」上依次临时添加 " + cidrs.Count + " 个网段的地址（如 192.168.1.250），对每段做 ARP 扫描，结束后自动删除临时地址并还原网卡配置。\n\n"
+                + (fromRange ? "探测段来自「扫描范围」：" : "扫描范围为空，使用默认 12 段：")
+                + head + "\n\n预计约 " + eta + "，期间该网卡会短暂断网。继续吗？";
             if (MessageBox.Show(this, ask, "探测直连设备", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
-
-            List<string> cidrs = new List<string>(cands);
             probeSegments = cidrs.Count;
             lastRows = new List<HostRow>();
             grid.Rows.Clear();
@@ -703,10 +724,11 @@ namespace LanScanner
                 lastRows.Add(r);
             }
             FillGrid(lastRows);
-            lblStatus.Text = string.Format("直连探测完成：{0} 台 · {1} 个段 · 临时地址已移除", hits.Count, probeSegments);
+            lblStatus.Text = string.Format("直连探测完成：{0} 台 · {1} 个段 · 网卡已还原", hits.Count, probeSegments);
             if (hits.Count == 0)
             {
-                Log("0 台：这些候选段里没有设备回应 ARP —— 设备可能不在这些段，或不在同一广播域（中间有交换机隔离/路由器）。");
+                Log("0 台：这些段里没有设备回应 ARP —— 设备可能不在这些段，或不在同一广播域（中间有交换机隔离/路由器）。");
+                Log("可以点「整个 /16」把扫描范围设成 192.168.0.0/16 再探测一次（覆盖 256 个段，约 3 分钟）。");
             }
         }
 

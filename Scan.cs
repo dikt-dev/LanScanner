@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -1011,14 +1012,190 @@ namespace LanScanner
             return outList;
         }
 
+        /// <summary>把任意前缀的段拆成 /24 列表：Run 每段只扫一个 C 段，/16 必须拆成 256 段。</summary>
+        static List<string> SplitTo24(List<string> cidrs, Action<string> log)
+        {
+            List<string> outList = new List<string>();
+            HashSet<uint> seenNets = new HashSet<uint>();
+            for (int i = 0; i < cidrs.Count; i++)
+            {
+                string c = cidrs[i] == null ? "" : cidrs[i].Trim();
+                if (c.Length == 0) continue;
+                int slash = c.IndexOf('/');
+                if (slash <= 0) { outList.Add(c); continue; }
+                int prefix;
+                string ipText = c.Substring(0, slash);
+                if (!int.TryParse(c.Substring(slash + 1), out prefix) || prefix < 0 || prefix > 32)
+                {
+                    if (log != null) log("跳过 " + c + "：前缀不对");
+                    continue;
+                }
+                IPAddress ip;
+                if (!IPAddress.TryParse(ipText, out ip) || ip.AddressFamily != AddressFamily.InterNetwork)
+                {
+                    if (log != null) log("跳过 " + c + "：地址格式不对");
+                    continue;
+                }
+                if (prefix > 24)
+                {
+                    if (log != null) log("跳过 " + c + "：只支持 /24 或更大范围");
+                    continue;
+                }
+                uint baseVal = IpUtil.ToUInt(ipText);
+                uint mask = prefix == 0 ? 0u : (0xFFFFFFFFu << (32 - prefix));
+                uint net = baseVal & mask;
+                int count = 1 << (24 - prefix);
+                if (outList.Count + count > 8192)
+                {
+                    if (log != null) log("跳过 " + c + "：段数太多（上限 8192 个 /24）");
+                    continue;
+                }
+                for (int k = 0; k < count; k++)
+                {
+                    uint n = net + (uint)(k << 8);
+                    if (!seenNets.Add(n)) continue;
+                    outList.Add(((n >> 24) & 255) + "." + ((n >> 16) & 255) + "." + ((n >> 8) & 255) + ".0/24");
+                }
+            }
+            return outList;
+        }
+
+        /// <summary>探测前的网卡配置快照，仅用于还原。</summary>
+        class IfSnapshot
+        {
+            public List<string> Addresses = new List<string>();   // "ip/prefix"
+            public List<string> Gateways = new List<string>();
+            public bool HasAddress { get { return Addresses.Count > 0; } }
+        }
+
+        static IfSnapshot SnapshotIf(string adapter)
+        {
+            IfSnapshot s = new IfSnapshot();
+            try
+            {
+                NetworkInterface[] all = NetworkInterface.GetAllNetworkInterfaces();
+                for (int i = 0; i < all.Length; i++)
+                {
+                    if (!string.Equals(all[i].Name, adapter, StringComparison.OrdinalIgnoreCase)) continue;
+                    IPInterfaceProperties props = all[i].GetIPProperties();
+                    foreach (UnicastIPAddressInformation u in props.UnicastAddresses)
+                    {
+                        if (u.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+                        s.Addresses.Add(u.Address + "/" + u.PrefixLength);
+                    }
+                    foreach (GatewayIPAddressInformation g in props.GatewayAddresses)
+                    {
+                        if (g.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+                        s.Gateways.Add(g.Address.ToString());
+                    }
+                    break;
+                }
+            }
+            catch { }
+            return s;
+        }
+
+        static string MaskFromPrefix(int prefix)
+        {
+            uint m = prefix <= 0 ? 0u : (prefix >= 32 ? 0xFFFFFFFFu : (0xFFFFFFFFu << (32 - prefix)));
+            return ((m >> 24) & 255) + "." + ((m >> 16) & 255) + "." + ((m >> 8) & 255) + "." + (m & 255);
+        }
+
+        /// <summary>等一个可用的（非 169.254）IPv4 地址，超时返回 null。</summary>
+        static string WaitUsableAddress(string adapter, int timeoutMs)
+        {
+            int waited = 0;
+            while (waited < timeoutMs)
+            {
+                try
+                {
+                    NetworkInterface[] all = NetworkInterface.GetAllNetworkInterfaces();
+                    for (int i = 0; i < all.Length; i++)
+                    {
+                        if (!string.Equals(all[i].Name, adapter, StringComparison.OrdinalIgnoreCase)) continue;
+                        foreach (UnicastIPAddressInformation u in all[i].GetIPProperties().UnicastAddresses)
+                        {
+                            if (u.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+                            string ip = u.Address.ToString();
+                            if (!ip.StartsWith("169.254.", StringComparison.Ordinal)) return ip;
+                        }
+                    }
+                }
+                catch { }
+                Thread.Sleep(500);
+                waited += 500;
+            }
+            return null;
+        }
+
+        /// <summary>按快照把地址/网关加回去（探测前是什么样，就还原成什么样）。</summary>
+        static void RestoreIf(string adapter, IfSnapshot snapshot, Action<string> log)
+        {
+            bool first = true;
+            for (int i = 0; i < snapshot.Addresses.Count; i++)
+            {
+                string a = snapshot.Addresses[i];
+                int slash = a.IndexOf('/');
+                if (slash <= 0) continue;
+                string ip = a.Substring(0, slash);
+                int prefix;
+                if (!int.TryParse(a.Substring(slash + 1), out prefix)) continue;
+                string mask = MaskFromPrefix(prefix);
+                if (first)
+                {
+                    string gw = snapshot.Gateways.Count > 0 ? snapshot.Gateways[0] : null;
+                    string args = "interface ipv4 set address name=\"" + adapter + "\" static " + ip + " " + mask;
+                    if (gw != null) args += " " + gw;
+                    Netsh(args);
+                    first = false;
+                }
+                else
+                {
+                    Netsh("interface ipv4 add address name=\"" + adapter + "\" address=" + ip + " mask=" + mask);
+                }
+            }
+            if (log != null) log("已按探测前的配置还原网卡（" + string.Join(", ", snapshot.Addresses.ToArray()) + "）");
+        }
+
+        /// <summary>把扫描范围文本展开成去重、排序的 /24 列表（直连探测用）。</summary>
+        public static List<string> SegmentsFromRange(string rangeText)
+        {
+            List<string> segs = new List<string>();
+            if (rangeText == null || rangeText.Trim().Length == 0) return segs;
+            string desc;
+            string err;
+            List<uint> addrs = RangeParser.Parse(rangeText, out desc, out err);
+            if (addrs == null || addrs.Count == 0)
+            {
+                // 通配写法（192.168.*.0/24）RangeParser 不认，交给 Expand + SplitTo24
+                List<string> parts = new List<string>();
+                string[] raw = rangeText.Replace('，', ',').Split(',');
+                for (int i = 0; i < raw.Length; i++) if (raw[i].Trim().Length > 0) parts.Add(raw[i].Trim());
+                return SplitTo24(Expand(parts), null);
+            }
+            HashSet<uint> nets = new HashSet<uint>();
+            for (int i = 0; i < addrs.Count; i++) nets.Add(addrs[i] & 0xFFFFFF00u);
+            List<uint> list = new List<uint>(nets);
+            list.Sort();
+            for (int i = 0; i < list.Count; i++)
+            {
+                uint n = list[i];
+                segs.Add(((n >> 24) & 255) + "." + ((n >> 16) & 255) + "." + ((n >> 8) & 255) + ".0/24");
+            }
+            return segs;
+        }
+
         public static List<Hit> Run(string adapter, List<string> cidrs, int concurrency, Action<string> log, CancellationToken token)
         {
             cidrs = Expand(cidrs);
+            cidrs = SplitTo24(cidrs, log);   // /16 → 256 个 /24，否则每段只扫一个 C 段
             List<Hit> hits = new List<Hit>();
             HashSet<string> seen = new HashSet<string>();
             HashSet<string> local = LocalAddresses();
             List<string> added = new List<string>();
             bool wasDhcp = GetDhcpEnabled(adapter);
+            IfSnapshot snapshot = SnapshotIf(adapter);
+            bool touched = false;   // 是否真的改过网卡：added 会在每段结束时清空，不能拿它当依据
             try
             {
                 for (int i = 0; i < cidrs.Count; i++)
@@ -1055,6 +1232,7 @@ namespace LanScanner
                         added.Add(tempIp);
                         local.Add(tempIp);
                         owned = true;
+                        touched = true;
                         if (log != null) log("临时添加 " + tempIp + "/24 → 扫描 " + cidr);
                     }
                     else
@@ -1090,11 +1268,28 @@ namespace LanScanner
                     Netsh("interface ipv4 delete address name=\"" + adapter + "\" address=" + added[i]);
                     if (log != null) log("已移除临时地址 " + added[i]);
                 }
-                // 加过静态地址后网卡可能被切成“静态”，原来走 DHCP 的要切回去，否则以后拿不到地址
-                if (added.Count > 0 && wasDhcp && !GetDhcpEnabled(adapter))
+                // 加过静态地址后网卡会被切成“静态”，原来走 DHCP 的必须切回去，否则以后拿不到地址
+                if (touched && wasDhcp)
                 {
                     Netsh("interface ipv4 set address name=\"" + adapter + "\" source=dhcp");
-                    if (log != null) log("网卡原本是 DHCP，已切回自动获取");
+                    string got = WaitUsableAddress(adapter, 20000);
+                    if (got != null)
+                    {
+                        if (log != null) log("网卡已恢复自动获取，当前地址 " + got);
+                    }
+                    else
+                    {
+                        if (log != null) log("网卡已切回自动获取，但 20 秒内没拿到地址（DHCP 服务器没响应）");
+                        if (snapshot.HasAddress)
+                        {
+                            RestoreIf(adapter, snapshot, log);
+                        }
+                    }
+                }
+                else if (touched && !wasDhcp)
+                {
+                    // 原本是静态配置：把探测前的地址/网关按快照加回去
+                    if (snapshot.HasAddress) RestoreIf(adapter, snapshot, log);
                 }
             }
             hits.Sort(delegate(Hit x, Hit y)
